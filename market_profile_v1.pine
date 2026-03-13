@@ -1,0 +1,272 @@
+// ══════════════════════════════════════════════════════════════════════════════
+//   MULTI-SESSION MARKET PROFILE  —  Full Visual Clone
+//   Pine Script v6  |  overlay=true
+//   Replicates: gray histogram, red POC cells, blue VA cells,
+//               volume numbers (M/K), current-price blue line + box,
+//               multi-session side columns
+// ══════════════════════════════════════════════════════════════════════════════
+//@version=6
+indicator("Multi-Session Market Profile [Clone]", overlay = true,
+         max_bars_back    = 5000,
+         max_lines_count  = 500,
+         max_boxes_count  = 500,
+         max_labels_count = 500)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ◆  INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+const string GRP_PROF = "═══  Profile Settings  ═══"
+const string GRP_DISP = "═══  Display Options   ═══"
+
+int   i_numSess = input.int  (6,     "Past Sessions to Show",    group = GRP_PROF, minval = 1,     maxval = 6)
+float i_rowSz   = input.float(0.20,  "Row Height (price units)", group = GRP_PROF, minval = 0.005, step   = 0.005,
+             tooltip = "Adjust for your instrument. XAU/USD ≈ 0.20, NQ ≈ 5, ES ≈ 1")
+float i_vaPct   = input.float(70.0,  "Value Area %",             group = GRP_PROF, minval = 10,    maxval = 100)
+int   i_histW   = input.int  (18,    "Histogram Width (bars)",   group = GRP_PROF, minval = 5,     maxval = 50)
+int   i_colW    = input.int  (6,     "Side Column Width (bars)", group = GRP_PROF, minval = 2,     maxval = 14)
+int   i_gap     = input.int  (1,     "Gap Between Columns",      group = GRP_PROF, minval = 0,     maxval = 4)
+
+bool  i_showVol = input.bool (true,  "Show Volume Numbers",         group = GRP_DISP)
+bool  i_showPOC = input.bool (true,  "Highlight POC (red)",         group = GRP_DISP)
+bool  i_showVA  = input.bool (true,  "Highlight Value Area",        group = GRP_DISP)
+bool  i_showLn  = input.bool (true,  "Show Current-Price Line",     group = GRP_DISP)
+bool  i_showCur = input.bool (true,  "Show Live Session Histogram", group = GRP_DISP)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ◆  COLORS  —  exact screenshot match
+// ─────────────────────────────────────────────────────────────────────────────
+color C_HIST    = color.rgb(92,  101, 116)       // gray histogram fill
+color C_HIST_VA = color.rgb(72,   82, 100)       // darker gray in VA zone
+color C_BLUE    = color.rgb(22,   65, 172)       // blue cell (Value Area)
+color C_RED     = color.rgb(160,  25,  48)       // red/crimson cell (POC)
+color C_LBLUE   = color.rgb(35,  130, 215)       // current-price blue line
+color C_TXT     = color.rgb(210, 215, 220)       // near-white text
+color C_DIM     = color.rgb(118, 124, 138)       // dimmed text
+color C_BORDER  = color.rgb(35,   42,  55)       // cell borders
+color C_NONE    = color.new(color.black, 100)    // fully transparent
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ◆  CONSTANTS
+// ─────────────────────────────────────────────────────────────────────────────
+const int MAX_ROWS = 60   // max price rows per session
+const int MAX_SESS = 6    // max completed sessions (circular buffer)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ◆  SESSION STORAGE  (flat array → vol_data[slot * MAX_ROWS + row])
+// ─────────────────────────────────────────────────────────────────────────────
+var float[] vol_data = array.new<float>(MAX_SESS * MAX_ROWS, 0.0)
+var float[] s_lo     = array.new<float>(MAX_SESS, na)
+var float[] s_hi     = array.new<float>(MAX_SESS, na)
+var int     n_done   = 0    // completed sessions stored (capped at MAX_SESS)
+var int     wr_ptr   = 0    // next circular write slot
+
+// Live-session accumulators
+var float   c_lo     = na
+var float   c_hi     = na
+var float[] c_vol    = array.new<float>(MAX_ROWS, 0.0)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ◆  HELPER: volume format → "47M" / "956K" / "276"
+// ─────────────────────────────────────────────────────────────────────────────
+f_fmt(float v) =>
+    v >= 1.0e6 ? str.tostring(math.round(v / 1.0e6)) + "M" :
+    v >= 1.0e3 ? str.tostring(math.round(v / 1.0e3)) + "K" :
+    str.tostring(math.round(v))
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ◆  SESSION DETECTION & ACCUMULATION
+// ─────────────────────────────────────────────────────────────────────────────
+// NOTE: Session boundaries are derived from daily (`"D"`) time changes.
+//       This works for standard daily sessions. For instruments with
+//       non-standard hours or custom sessions, adjust the timeframe string.
+bool new_sess = ta.change(time("D")) != 0
+
+if new_sess
+    // ── Finalise the just-completed session ──────────────────────────────────
+    if not na(c_lo)
+        int slot = wr_ptr % MAX_SESS
+        array.set(s_lo, slot, c_lo)
+        array.set(s_hi, slot, c_hi)
+        for int r = 0 to MAX_ROWS - 1
+            array.set(vol_data, slot * MAX_ROWS + r, array.get(c_vol, r))
+        n_done := math.min(n_done + 1, MAX_SESS)
+        wr_ptr += 1
+    // ── Reset live accumulators ───────────────────────────────────────────────
+    c_lo := na
+    c_hi := na
+    array.fill(c_vol, 0.0)
+
+// ── Accumulate this bar ───────────────────────────────────────────────────────
+float mid = (high + low) * 0.5
+if na(c_lo)
+    c_lo := low
+    c_hi := high
+else
+    c_lo := math.min(c_lo, low)
+    c_hi := math.max(c_hi, high)
+
+// Clamp the float ratio before casting to int to avoid integer overflow on
+// very tight row sizes or wide-ranging instruments.
+float _raw_idx = (mid - c_lo) / i_rowSz
+int   r_idx    = math.max(0, math.min(int(math.min(_raw_idx, float(MAX_ROWS - 1))), MAX_ROWS - 1))
+array.set(c_vol, r_idx, array.get(c_vol, r_idx) + volume)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ◆  HELPER: compute POC / VAL / VAH rows for a volume array
+// ─────────────────────────────────────────────────────────────────────────────
+f_profile_stats(float[] vols, float base_p, float top_p) =>
+    int   n_rows = math.min(int((top_p - base_p) / i_rowSz) + 1, MAX_ROWS)
+    float max_v  = 0.0
+    int   poc_r  = 0
+    float tot_v  = 0.0
+
+    for int r = 0 to n_rows - 1
+        float v = array.get(vols, r)
+        tot_v += v
+        if v > max_v
+            max_v := v
+            poc_r := r
+
+    // ── Value Area expansion ──────────────────────────────────────────────────
+    float target = tot_v * i_vaPct / 100.0
+    float va_v   = array.get(vols, poc_r)
+    int   vah_r  = poc_r
+    int   val_r  = poc_r
+    int   up     = poc_r + 1
+    int   dn     = poc_r - 1
+
+    for int _i = 0 to MAX_ROWS
+        if va_v >= target
+            break
+        float up_v = (up < n_rows and up < MAX_ROWS) ? array.get(vols, up) : 0.0
+        float dn_v = (dn >= 0)                        ? array.get(vols, dn) : 0.0
+        if up_v >= dn_v and up < n_rows
+            va_v  += up_v
+            vah_r := up
+            up    += 1
+        else if dn >= 0
+            va_v  += dn_v
+            val_r := dn
+            dn    -= 1
+        else
+            break
+
+    [n_rows, poc_r, val_r, vah_r, max_v]
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ◆  RENDER SESSION  (shared drawing routine)
+// ─────────────────────────────────────────────────────────────────────────────
+f_draw_session(float[] vols, float base_p, float top_p,
+               int x_left, int x_right, bool is_main) =>
+    [n_rows, poc_r, val_r, vah_r, max_v] = f_profile_stats(vols, base_p, top_p)
+    int col_w = x_right - x_left
+
+    for int r = 0 to n_rows - 1
+        float v = array.get(vols, r)
+        if v <= 0.0
+            continue
+        float row_lo = base_p + r * i_rowSz
+        float row_hi = row_lo + i_rowSz
+        bool  is_poc = i_showPOC and r == poc_r
+        bool  is_va  = i_showVA  and r >= val_r and r <= vah_r
+
+        if is_main and max_v > 0.0
+            // ── Proportional histogram bar (main session) ─────────────────────
+            int   bw    = math.max(1, int(v / max_v * col_w))
+            color bg_c  = is_poc ? C_RED  : is_va ? C_HIST_VA : C_HIST
+            color brd_c = is_poc ? C_RED  : is_va ? C_BLUE    : C_BORDER
+            box.new(x_right - bw, row_lo, x_right, row_hi,
+                    bgcolor      = bg_c,
+                    border_color = brd_c,
+                    border_width = 1)
+            // Ghost outline — full-width empty frame behind the bar
+            box.new(x_left, row_lo, x_right, row_hi,
+                    bgcolor      = C_NONE,
+                    border_color = C_BORDER,
+                    border_width = 1)
+        else
+            // ── Solid colour cell (side session columns) ──────────────────────
+            color bg_c  = is_poc ? C_RED  : is_va ? C_BLUE : C_NONE
+            color brd_c = is_poc ? C_RED  : is_va ? C_BLUE : C_BORDER
+            box.new(x_left, row_lo, x_right, row_hi,
+                    bgcolor      = bg_c,
+                    border_color = brd_c,
+                    border_width = 1)
+
+        // ── Volume label ──────────────────────────────────────────────────────
+        if i_showVol
+            color tc    = (is_poc or is_va) ? C_TXT : C_DIM
+            int   mid_x = int((x_left + x_right) / 2)
+            float mid_y = (row_lo + row_hi) / 2.0
+            label.new(mid_x, mid_y, f_fmt(v),
+                      style     = label.style_none,
+                      color     = C_NONE,
+                      textcolor = tc,
+                      size      = size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ◆  MAIN RENDER  —  barstate.islast only
+// ─────────────────────────────────────────────────────────────────────────────
+if barstate.islast
+
+    // ── 1) LIVE session — wide central histogram ──────────────────────────────
+    if i_showCur and not na(c_lo) and c_hi > c_lo
+        int x_r = bar_index
+        int x_l = bar_index - i_histW
+        float[] live_vols = array.copy(c_vol)
+        f_draw_session(live_vols, c_lo, c_hi, x_l, x_r, true)
+
+    // ── 2) COMPLETED sessions — narrow side columns left of live histogram ────
+    int n_show = math.min(n_done, i_numSess)
+
+    if n_show >= 1
+        for int si_rel = 0 to n_show - 1
+            int raw  = wr_ptr - 1 - si_rel
+            int slot = (raw % MAX_SESS + MAX_SESS) % MAX_SESS
+
+            float base_p = array.get(s_lo, slot)
+            float top_p  = array.get(s_hi, slot)
+
+            if na(base_p) or na(top_p) or top_p <= base_p
+                continue
+
+            int x_r = bar_index - i_histW - i_gap - si_rel * (i_colW + i_gap)
+            int x_l = x_r - i_colW
+
+            if x_l < 0
+                continue
+
+            float[] sess_vols = array.new<float>(MAX_ROWS, 0.0)
+            for int r = 0 to MAX_ROWS - 1
+                array.set(sess_vols, r, array.get(vol_data, slot * MAX_ROWS + r))
+
+            f_draw_session(sess_vols, base_p, top_p, x_l, x_r, false)
+
+    // ── 3) Current-price horizontal line + price label ────────────────────────
+    if i_showLn
+        int x_end   = bar_index + 4
+        int x_start = math.max(bar_index - i_histW - n_show * (i_colW + i_gap) - 5, 0)
+
+        line.new(x_start, close, x_end, close,
+                 color  = C_LBLUE,
+                 width  = 2,
+                 extend = extend.none)
+
+        label.new(x_end, close,
+                  str.tostring(close, format.mintick),
+                  style     = label.style_label_left,
+                  color     = C_LBLUE,
+                  textcolor = C_TXT,
+                  size      = size.small)
+
+    // ── 4) Round-number reference line (replicates solid blue at 92.00) ───────
+    // Rounds to the nearest integer. For instruments with fractional round
+    // numbers (e.g. forex at 1.0500) consider rounding to a larger tick step.
+    float round_lvl = float(math.round(close))
+    int   rl_x1     = bar_index - i_histW - n_show * (i_colW + i_gap) - 2
+    int   rl_x2     = bar_index + 2
+
+    line.new(rl_x1, round_lvl, rl_x2, round_lvl,
+             color = color.new(C_LBLUE, 30),
+             width = 1,
+             style = line.style_solid)
