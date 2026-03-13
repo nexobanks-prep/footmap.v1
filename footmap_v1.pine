@@ -1,0 +1,262 @@
+// ============================================================
+// Footmap – Heat & Volume [v1]
+// ============================================================
+// A footprint-chart approximation for TradingView Pine Script v6.
+//
+// How it works:
+//   Each confirmed candle is divided into N equidistant price
+//   levels.  Volume is distributed across those levels in
+//   proportion to how much of the candle range they cover.
+//   Buying vs selling pressure is estimated from the candle
+//   anatomy: a close near the top implies more buying.
+//
+//   Drawing objects:
+//     • Heatmap boxes  – one box per price level, coloured by
+//                        buy/sell dominance, opacity driven by
+//                        relative volume (more opaque = more vol)
+//     • POC line       – dashed yellow line through the highest-
+//                        volume level (Point of Control)
+//     • Delta labels   – net buy/sell imbalance shown below each
+//                        candle
+//     • Cumulative Δ   – running sum of delta shown as a plot
+//
+// ============================================================
+//@version=6
+indicator("Footmap – Heat & Volume [v1]",
+          shorttitle       = "Footmap v1",
+          overlay          = true,
+          max_boxes_count  = 500,
+          max_lines_count  = 500,
+          max_labels_count = 500)
+
+// ────────────────────────────────────────────────────────────
+// INPUTS
+// ────────────────────────────────────────────────────────────
+
+string GRP_FP   = "Footprint"
+string GRP_COL  = "Colors"
+string GRP_DISP = "Display"
+
+int   i_levels     = input.int  (8,     "Price levels per bar",        minval = 2,  maxval = 30,  group = GRP_FP)
+int   i_lookback   = input.int  (20,    "Bars to display",             minval = 1,  maxval = 50,  group = GRP_FP)
+bool  i_show_poc   = input.bool (true,  "Show Point of Control (POC)",               group = GRP_FP)
+bool  i_show_delta = input.bool (true,  "Show delta labels",                         group = GRP_FP)
+bool  i_show_vol   = input.bool (true,  "Show POC volume label",                     group = GRP_FP)
+int   i_transp_lo  = input.int  (20,    "Opacity – high volume  (0–95)", minval = 0,  maxval = 95,  group = GRP_DISP,
+                                tooltip = "Transparency of boxes at peak volume (lower = more opaque)")
+int   i_transp_hi  = input.int  (80,    "Opacity – low  volume  (0–95)", minval = 0,  maxval = 95,  group = GRP_DISP,
+                                tooltip = "Transparency of boxes at minimal volume (higher = more transparent)")
+
+color i_bull_col   = input.color(#00C853, "Buy colour",               group = GRP_COL)
+color i_bear_col   = input.color(#D50000, "Sell colour",              group = GRP_COL)
+color i_poc_col    = input.color(#FFD700, "POC colour",               group = GRP_COL)
+color i_dpos_col   = input.color(#00BFA5, "Positive delta label",     group = GRP_COL)
+color i_dneg_col   = input.color(#FF6F00, "Negative delta label",     group = GRP_COL)
+
+// ────────────────────────────────────────────────────────────
+// VOLUME APPROXIMATION
+// ────────────────────────────────────────────────────────────
+// Candle anatomy-based split:
+//   buy_vol  ≈ volume × (close − low)  / (high − low)
+//   sell_vol ≈ volume × (high − close) / (high − low)
+
+float _range    = high - low
+float _buy_vol  = _range > 0 ? volume * (close - low)  / _range : volume * 0.5
+float _sell_vol = _range > 0 ? volume * (high - close) / _range : volume * 0.5
+float _delta    = _buy_vol - _sell_vol
+
+// Cumulative delta: running sum across all bars (session-wide total)
+var float _cum_delta = 0.0
+if barstate.isconfirmed
+    _cum_delta += _delta
+
+// ────────────────────────────────────────────────────────────
+// HELPER – volume at one price level (proportional overlap)
+// ────────────────────────────────────────────────────────────
+f_level_vol(float bar_hi, float bar_lo, float bar_vol,
+            float lvl_lo, float lvl_hi) =>
+    float brange = bar_hi - bar_lo
+    if brange <= 0.0
+        bar_vol / i_levels
+    else
+        float olo = math.max(bar_lo, lvl_lo)
+        float ohi = math.min(bar_hi, lvl_hi)
+        float olap = math.max(0.0, ohi - olo)
+        bar_vol * (olap / brange)
+
+// ────────────────────────────────────────────────────────────
+// DRAWING OBJECT STORES
+// ────────────────────────────────────────────────────────────
+var box[]   _boxes  = array.new<box>()
+var line[]  _lines  = array.new<line>()
+var label[] _labels = array.new<label>()
+
+// Purge objects that exceed the lookback window
+f_purge() =>
+    int max_b = i_lookback * i_levels
+    while array.size(_boxes) > max_b
+        box.delete(array.shift(_boxes))
+    int max_l = i_lookback
+    while array.size(_lines) > max_l
+        line.delete(array.shift(_lines))
+    // Labels per bar: POC vol label (if enabled) + delta label (if enabled)
+    int labels_per_bar = (i_show_vol ? 1 : 0) + (i_show_delta ? 1 : 0)
+    int max_lbl = math.max(1, i_lookback * labels_per_bar)
+    while array.size(_labels) > max_lbl
+        label.delete(array.shift(_labels))
+
+// ────────────────────────────────────────────────────────────
+// DRAW ONE BAR'S FOOTMAP
+// ────────────────────────────────────────────────────────────
+f_draw_bar(int    bidx,
+           float  bhi,  float blo,
+           float  bvol, float bbuy, float bsell,
+           float  bdelta) =>
+
+    float prange = bhi - blo
+    if prange > 0.0
+        float lvl_sz = prange / i_levels
+
+        // ── first pass: compute per-level volumes ──────────
+        float[] vols  = array.new<float>(i_levels, 0.0)
+        float[] buys  = array.new<float>(i_levels, 0.0)
+        float[] sells = array.new<float>(i_levels, 0.0)
+        float   maxv  = 0.0
+        int     poc   = 0
+
+        for i = 0 to i_levels - 1
+            float llo = blo + i       * lvl_sz
+            float lhi = blo + (i + 1) * lvl_sz
+            float lv  = f_level_vol(bhi, blo, bvol,  llo, lhi)
+            float lb  = f_level_vol(bhi, blo, bbuy,  llo, lhi)
+            float ls  = f_level_vol(bhi, blo, bsell, llo, lhi)
+            array.set(vols,  i, lv)
+            array.set(buys,  i, lb)
+            array.set(sells, i, ls)
+            if lv > maxv
+                maxv := lv
+                poc  := i
+
+        // ── second pass: draw heatmap boxes ───────────────
+        for i = 0 to i_levels - 1
+            float llo      = blo + i       * lvl_sz
+            float lhi      = blo + (i + 1) * lvl_sz
+            float lv       = array.get(vols,  i)
+            float lb       = array.get(buys,  i)
+            float ls       = array.get(sells, i)
+            bool  is_poc   = (i == poc) and i_show_poc
+
+            // Transparency: linearly mapped from i_transp_lo (max vol)
+            // to i_transp_hi (zero vol)
+            float intensity = maxv > 0.0 ? lv / maxv : 0.0
+            int   tr = int(math.round(
+                          i_transp_hi - intensity * (i_transp_hi - i_transp_lo)))
+            tr := math.min(95, math.max(0, tr))
+
+            color base_col = is_poc ? i_poc_col : (lb >= ls ? i_bull_col : i_bear_col)
+            color bcol     = color.new(base_col, is_poc ? math.min(tr, 40) : tr)
+
+            box b = box.new(
+                 left         = bidx,
+                 top          = lhi,
+                 right        = bidx + 1,
+                 bottom       = llo,
+                 bgcolor      = bcol,
+                 border_color = color.new(color.gray, 92),
+                 border_width = 1)
+            array.push(_boxes, b)
+
+            // ── POC volume label ───────────────────────────
+            if is_poc and i_show_vol
+                string vtxt = lv >= 1e6 ?
+                     str.tostring(math.round(lv / 1e6, 2)) + "M" :
+                     lv >= 1e3 ?
+                     str.tostring(math.round(lv / 1e3, 1)) + "K" :
+                     str.tostring(math.round(lv))
+                label lbl = label.new(
+                     x         = bidx + 1,
+                     y         = (llo + lhi) / 2.0,
+                     text      = vtxt,
+                     style     = label.style_label_left,
+                     color     = color.new(i_poc_col, 40),
+                     textcolor = color.white,
+                     size      = size.tiny)
+                array.push(_labels, lbl)
+
+        // ── POC centre line ────────────────────────────────
+        if i_show_poc
+            float poc_lo = blo + poc       * lvl_sz
+            float poc_hi = blo + (poc + 1) * lvl_sz
+            float poc_y  = (poc_lo + poc_hi) / 2.0
+            line pl = line.new(
+                 x1    = bidx,
+                 y1    = poc_y,
+                 x2    = bidx + 1,
+                 y2    = poc_y,
+                 color = i_poc_col,
+                 width = 2,
+                 style = line.style_dashed)
+            array.push(_lines, pl)
+
+        // ── Delta label below the bar ──────────────────────
+        if i_show_delta
+            string sign  = bdelta >= 0.0 ? "+" : "-"
+            string dtxt  = "Δ " + sign +
+                           (math.abs(bdelta) >= 1e6 ?
+                            str.tostring(math.round(math.abs(bdelta) / 1e6, 2)) + "M" :
+                            math.abs(bdelta) >= 1e3 ?
+                            str.tostring(math.round(math.abs(bdelta) / 1e3, 1)) + "K" :
+                            str.tostring(math.round(math.abs(bdelta))))
+            color dcol   = bdelta >= 0.0 ? i_dpos_col : i_dneg_col
+            label dlbl   = label.new(
+                 x         = bidx,
+                 y         = blo,
+                 text      = dtxt,
+                 style     = label.style_label_up,
+                 color     = color.new(dcol, 40),
+                 textcolor = color.white,
+                 size      = size.tiny,
+                 tooltip   = "Bar delta: net buy − sell volume")
+            array.push(_labels, dlbl)
+
+// ────────────────────────────────────────────────────────────
+// MAIN – execute on each confirmed bar
+// ────────────────────────────────────────────────────────────
+if barstate.isconfirmed
+    f_draw_bar(bar_index, high, low, volume, _buy_vol, _sell_vol, _delta)
+    f_purge()
+
+// ────────────────────────────────────────────────────────────
+// CUMULATIVE DELTA LABEL  (live-updated on the last bar)
+// ────────────────────────────────────────────────────────────
+// Reuse a single persistent label so we don't accumulate objects
+// on every tick update of the current bar.
+var label _cum_lbl = na
+
+if barstate.islast
+    string sign  = _cum_delta >= 0.0 ? "+" : "-"
+    string ctxt  = "CumΔ " + sign +
+                   (math.abs(_cum_delta) >= 1e9 ?
+                    str.tostring(math.round(math.abs(_cum_delta) / 1e9, 2)) + "B" :
+                    math.abs(_cum_delta) >= 1e6 ?
+                    str.tostring(math.round(math.abs(_cum_delta) / 1e6, 2)) + "M" :
+                    math.abs(_cum_delta) >= 1e3 ?
+                    str.tostring(math.round(math.abs(_cum_delta) / 1e3, 1)) + "K" :
+                    str.tostring(math.round(math.abs(_cum_delta))))
+    color ccol   = _cum_delta >= 0.0 ? i_dpos_col : i_dneg_col
+
+    if na(_cum_lbl)
+        _cum_lbl := label.new(
+             x         = bar_index + 1,
+             y         = close,
+             text      = ctxt,
+             style     = label.style_label_left,
+             color     = color.new(ccol, 30),
+             textcolor = color.white,
+             size      = size.small,
+             tooltip   = "Cumulative delta (buy − sell) across all visible bars")
+    else
+        label.set_x    (_cum_lbl, bar_index + 1)
+        label.set_y    (_cum_lbl, close)
+        label.set_text (_cum_lbl, ctxt)
+        label.set_color(_cum_lbl, color.new(ccol, 30))
